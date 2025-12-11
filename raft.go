@@ -11,6 +11,11 @@ import (
 )
 
 //1.Vote Request (candidate -> follower)
+type RaftLogEntry struct {
+	Term    int
+	Command string // e.g., "SET user:123 Batman"
+}
+
 type RequestVoteArgs struct {
 	Term int
 	CandidateID string
@@ -22,9 +27,10 @@ type RequestVoteReply struct {
 }
 //2.HeartBeat/ Log Replication (Leader -> Follower)
 type AppendEntriesArgs struct {
-	Term int
-	LeaderID string
-	//We will add the log entries later
+	Term         int
+	LeaderID     string
+	Entries      []RaftLogEntry // New data to sync
+	LeaderCommit int        // How much of the log is safe to write to DB?
 }
 //3.AppendEntries (Follower -> Leader)
 type AppendEntriesReply struct {
@@ -53,6 +59,10 @@ type RaftNode struct {
 	electionResetEvent time.Time
 	
 	peerClients map[string]*rpc.Client
+	
+	log         []RaftLogEntry
+	commitIndex int
+	applyCh     chan string // Send commands here once they are safe
 }
 
 //StartRPC starts the internal Raft server
@@ -76,6 +86,31 @@ func (rn *RaftNode) StartRPC() {
 			go server.ServeConn(conn)
 		}
 	}()
+}
+
+// Propose adds a command to the log and replicates it
+func (rn *RaftNode) Propose(command string) bool {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
+	if rn.state != Leader {
+		return false // Only Leader can accept writes
+	}
+
+	// Add to local log
+	entry := RaftLogEntry{
+		Term:    rn.currentTerm,
+		Command: command,
+	}
+	rn.log = append(rn.log, entry)
+	rn.commitIndex++ // UNSAFE auto-commit for Phase 4 demo
+
+	fmt.Printf("[%s] 📝 New Command Proposed: %s\n", rn.id, command)
+	
+	// Apply locally immediately
+	go func() { rn.applyCh <- command }()
+	
+	return true
 }
 
 // RequestVote is called by a Candidate to ask for a vote
@@ -128,6 +163,17 @@ func (rn *RaftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesR
 		rn.currentTerm = args.Term
 		rn.state = Follower // Ensure we are follower
 		rn.electionResetEvent = time.Now() // RESET TIMER! We heard from boss.
+		
+		// Sync Log
+		rn.log = args.Entries
+		
+		// Commit?
+		if args.LeaderCommit > rn.commitIndex {
+			for i := rn.commitIndex; i < len(rn.log) && i < args.LeaderCommit; i++ {
+				rn.applyCh <- rn.log[i].Command
+			}
+			rn.commitIndex = args.LeaderCommit
+		}
 	}
 
 	reply.Term = rn.currentTerm
@@ -158,13 +204,16 @@ func (rn *RaftNode) getPeerClient(peerID string) (*rpc.Client, error) {
 	return newClient, nil
 }
 
-func NewRaftNode(id string, peers []string) *RaftNode {
+func NewRaftNode(id string, peers []string, applyCh chan string) *RaftNode {
 	return &RaftNode{
 		id:                 id,
 		peers:              peers,
 		state:              Follower,
 		electionResetEvent: time.Now(),
 		peerClients:        make(map[string]*rpc.Client),
+		log:                make([]RaftLogEntry, 0),
+		commitIndex:        0,
+		applyCh:            applyCh,
 	}
 }
 
@@ -276,6 +325,8 @@ func (rn *RaftNode) broadcastHeartbeat() {
 			args := AppendEntriesArgs{
 				Term:     term,
 				LeaderID: id,
+				Entries:  rn.log,
+				LeaderCommit: rn.commitIndex,
 			}
 			var reply AppendEntriesReply
 

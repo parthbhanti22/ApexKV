@@ -2,6 +2,8 @@ package main
 
 import (
 	"flag"
+	"fmt"
+	"strconv"
 	"strings"
 	"time"
 	"math/rand"
@@ -19,16 +21,37 @@ func main() {
 	rand.Seed(time.Now().UnixNano())
 
 	// 2. Start Raft RPC Server (This listens on localhost:8001)
-	raft := NewRaftNode(*id, peers)
-	raft.StartRPC() // <--- NEW: Open the phone lines!
+	// 2. Setup Raft and Commit Channel
+	fmt.Println("🚀 Starting Raft Node...")
+	applyCh := make(chan string)
+	raft := NewRaftNode(*id, peers, applyCh)
+	raft.StartRPC() 
 	go raft.Run()
 
-    // 2. Start DB Server (On a different port, e.g., 9001)
-    // Extract port 8001 -> 9001
-    // Simple hack for now:
-    // This is just to keep the DB alive, we won't use it for this test yet.
-    _ = strings.Split(*id, ":")[1]
-    
-    // Just block forever here so the program doesn't exit
-    select {} 
+	// 3. Start DB and Server
+	raftPortStr := strings.Split(*id, ":")[1]
+	raftPort, _ := strconv.Atoi(raftPortStr)
+	dbPort := fmt.Sprintf(":%d", raftPort+1000)
+
+	dbName := "apex_" + raftPortStr + ".db"
+	db, _ := NewDB(dbName)
+	defer db.Close()
+	
+	server := NewServer(db, raft)
+
+	// 4. Start Committer Loop
+	go func() {
+		for msg := range applyCh {
+			parts := strings.Split(msg, " ")
+			if len(parts) >= 3 {
+					k, v := parts[1], parts[2]
+					db.Set(k, v) 
+					fmt.Printf("✅ [%s] Committed to Disk: %s %s\n", *id, k, v)
+			}
+		}
+	}()
+	
+	// Blocks main
+	fmt.Printf("🔥 ApexDB Listening for Clients on %s\n", dbPort)
+	server.Start(dbPort)
 }

@@ -10,11 +10,12 @@ import(
 //server holds the db and the listener
 
 type Server struct {
-	db *DB 
+	db   *DB 
+	raft *RaftNode
 }
 
-func NewServer(db *DB) *Server {
-	return &Server{db: db}
+func NewServer(db *DB, raft *RaftNode) *Server {
+	return &Server{db: db, raft: raft}
 }
 
 //start opens the port and waits for connections
@@ -92,10 +93,11 @@ func (s *Server) handleSet(conn net.Conn) {
 	key := string(body[:keyLen])
 	value := string(body[keyLen:])
 
-	err = s.db.Set(key, value)
+	command := fmt.Sprintf("SET %s %s", key, value)
+	success := s.raft.Propose(command)
 	
 	// Send Response (0x00 = Success, 0x01 = Error)
-	if err != nil {
+	if !success {
 		conn.Write([]byte{0x01}) 
 	} else {
 		conn.Write([]byte{0x00})
